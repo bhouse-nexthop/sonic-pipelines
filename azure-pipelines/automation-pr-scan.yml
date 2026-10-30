@@ -105,8 +105,9 @@ jobs:
             # fi
             automerge_prs=$(gh pr list -A mssonicbld --label automerge -R $repo -L 100 --search "created:>=$date_1m_ago_q" --json body,title,url,labels,statusCheckRollup,createdAt,baseRefName,comments)
             upgrade_versions_prs=$(gh pr list -A mssonicbld -R $repo -L 100 --search "(\"Upgrade SONiC package Versions\" OR \"Upgrade docker-sonic-mgmt package versions\" OR \"Upgrade docker-ptf package versions\") in:title created:>=$date_1m_ago_q" --json body,title,url,labels,statusCheckRollup,createdAt,baseRefName,comments)
-            # Renovate labels a security update automerge only when it is not a major bump
-            renovate_prs=$(gh pr list -A app/renovate --label automerge --label security -R $repo -L 100 --search "created:>=$date_1m_ago_q" --json author,body,title,url,labels,statusCheckRollup,createdAt,baseRefName,comments,headRefOid)
+            # Renovate labels a security update automerge only when it is not a major bump. Listed at any age:
+            # a security update can stay open past a month while a blocker is fixed, and still has to merge
+            renovate_prs=$(gh pr list -A app/renovate --label automerge --label security -R $repo -L 100 --json author,body,title,url,labels,statusCheckRollup,createdAt,baseRefName,comments,headRefOid)
             qualified_approval_prs=$(gh pr list --label Qualified-approval -R $repo -L 100 --search "created:>=$date_1m_ago_q" --json author,body,title,url,labels,statusCheckRollup,createdAt,baseRefName,comments,headRefOid)
             prs=$(jq -sc 'add | unique_by(.url)' <(echo "$automerge_prs") <(echo "$upgrade_versions_prs") <(echo "$renovate_prs") <(echo "$qualified_approval_prs"))
             c=$(echo $prs | jq length)
