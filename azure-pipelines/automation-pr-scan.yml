@@ -71,22 +71,30 @@ jobs:
               and ($names | any(test("^(Azure|sonic-net)\\.sonic")))
           ' <<< "$1" || echo false
         }
-        # The checks of a Renovate PR's head commit, in the shape of statusCheckRollup. The rollup
-        # leaves out runs that no pull request event started, such as the CodeQL and Semgrep runs the
-        # go.sum workflow dispatches on its fixup commit, so a required check would never be found.
-        # Branch protection matches required checks by name on the commit, and so does this: the
-        # newest check run of each name, and each commit status. Prints null when either call fails.
-        renovate_head_checks() {
+        # A Renovate PR's checks: its statusCheckRollup, plus each required check of the base branch
+        # that the rollup lacks, read from the head commit. The rollup leaves out runs that no pull
+        # request event started, such as the CodeQL and Semgrep runs the go.sum workflow dispatches on
+        # its fixup commit, so a required check would never be found. Branch protection matches a
+        # required check by name on the commit, and so does this: the newest check run of that name,
+        # or else the newest commit status of that context. Every check in the rollup is kept and
+        # evaluated as before. Prints null when a call fails.
+        renovate_checks() {
           local runs statuses
           runs=$(gh api --paginate "repos/$1/commits/$2/check-runs?per_page=100" --jq '.check_runs[]') &&
           statuses=$(gh api --paginate "repos/$1/commits/$2/statuses?per_page=100" --jq '.[]') &&
-          jq -sc --argjson runs "$(jq -sc . <<< "$runs")" '
-            ($runs | group_by(.name) | map(max_by(.id)
-              | { __typename: "CheckRun", name, status: (.status | ascii_upcase),
-                  conclusion: (.conclusion // "" | ascii_upcase) }))
-            + (group_by(.context) | map(max_by(.id)
-              | { __typename: "StatusContext", context, state: (.state | ascii_upcase) }))
-          ' <<< "$statuses" || echo null
+          jq -c --argjson required "$4" --argjson runs "$(jq -sc . <<< "$runs")" \
+              --argjson statuses "$(jq -sc . <<< "$statuses")" '
+            (. // []) as $rollup
+            | [ $rollup[] | .name // .context ] as $names
+            | $rollup + [ $required[] | select(. as $r | $names | index([$r]) == null) as $r
+                | ([ $runs[] | select(.name == $r) ] | max_by(.id)) as $run
+                | ([ $statuses[] | select(.context == $r) ] | max_by(.id)) as $status
+                | if $run then { __typename: "CheckRun", name: $r, status: ($run.status | ascii_upcase),
+                                 conclusion: ($run.conclusion // "" | ascii_upcase) }
+                  elif $status then { __typename: "StatusContext", context: $r,
+                                      state: ($status.state | ascii_upcase) }
+                  else empty end ]
+          ' <<< "$3" || echo null
         }
         # Anyone with write access can push to a Renovate branch, and a pushed commit can name any author.
         # Prints true only when every commit on the PR was signed by GitHub and authored by renovate[bot],
@@ -177,8 +185,8 @@ jobs:
               merge_head=''
               if [[ $(echo $pr | jq -r '.author.login // ""') == "app/renovate" ]]; then
                 renovate=true
-                checks=$(renovate_head_checks "$repo" "$(echo $pr | jq -r .headRefOid)")
                 required=$(gh api "repos/$repo/branches/$(echo $pr | jq -r .baseRefName)" --jq '.protection.required_status_checks.contexts // []' || echo null)
+                [[ $required != null ]] && checks=$(renovate_checks "$repo" "$(echo $pr | jq -r .headRefOid)" "$checks" "$required")
                 pr_success=false
                 [[ $required != null && $(renovate_checks_pass "$checks" "$required") == true \
                   && $(renovate_commits_pass "$repo" "${url##*/}" "$(echo $pr | jq -r .headRefOid)") == true ]] && pr_success=true
