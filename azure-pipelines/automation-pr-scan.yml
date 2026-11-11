@@ -75,10 +75,12 @@ jobs:
         # that the rollup lacks, read from the head commit. The rollup leaves out runs that no pull
         # request event started, such as the CodeQL and Semgrep runs the go.sum workflow dispatches on
         # its fixup commit, so a required check would never be found. Branch protection matches a
-        # required check by name on the commit, and so does this: the newest check run of that name,
-        # or else the newest commit status of that context. Every check in the rollup is kept and
-        # evaluated as before. Prints null when a call fails. The runs and statuses go through files,
-        # not arguments: a commit's check runs can be larger than one argument may be.
+        # required check by name on the commit and requires every check run and commit status of that
+        # name to pass, and so does this: the newest check run of that name and the newest commit
+        # status of that context are both added, each one only when the rollup lacks that kind. Every
+        # check in the rollup is kept and evaluated as before. Prints null when a call fails. The runs
+        # and statuses go through files, not arguments: a commit's check runs can be larger than one
+        # argument may be.
         renovate_checks() {
           local runs statuses
           runs=$(gh api --paginate "repos/$1/commits/$2/check-runs?per_page=100" \
@@ -87,15 +89,16 @@ jobs:
           jq -c --argjson required "$4" --slurpfile runs <(printf '%s\n' "$runs") \
               --slurpfile statuses <(printf '%s\n' "$statuses") '
             (. // []) as $rollup
-            | [ $rollup[] | .name // .context ] as $names
-            | $rollup + [ $required[] | select(. as $r | $names | index([$r]) == null) as $r
-                | ([ $runs[] | select(.name == $r) ] | max_by(.id)) as $run
-                | ([ $statuses[] | select(.context == $r) ] | max_by(.id)) as $status
-                | if $run then { __typename: "CheckRun", name: $r, status: ($run.status | ascii_upcase),
-                                 conclusion: ($run.conclusion // "" | ascii_upcase) }
-                  elif $status then { __typename: "StatusContext", context: $r,
-                                      state: ($status.state | ascii_upcase) }
-                  else empty end ]
+            | [ $rollup[] | select(.__typename != "StatusContext") | .name ] as $run_names
+            | [ $rollup[] | select(.__typename == "StatusContext") | .context ] as $status_names
+            | $rollup + [ $required[] as $r
+                | (select($run_names | index([$r]) == null)
+                   | [ $runs[] | select(.name == $r) ] | max_by(.id) // empty
+                   | { __typename: "CheckRun", name: $r, status: (.status | ascii_upcase),
+                       conclusion: (.conclusion // "" | ascii_upcase) }),
+                  (select($status_names | index([$r]) == null)
+                   | [ $statuses[] | select(.context == $r) ] | max_by(.id) // empty
+                   | { __typename: "StatusContext", context: $r, state: (.state | ascii_upcase) }) ]
           ' <<< "$3" || echo null
         }
         # Anyone with write access can push to a Renovate branch, and a pushed commit can name any author.
