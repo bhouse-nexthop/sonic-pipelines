@@ -100,24 +100,28 @@ jobs:
         # Anyone with write access can push to a Renovate branch, and a pushed commit can name any author.
         # Prints true only when every commit on the PR was signed by GitHub and authored by renovate[bot],
         # or by github-actions[bot] for a fixup a repository's workflow makes to Renovate's commit (go.sum
-        # where Renovate cannot update it), and the last one is the head commit evaluated. Any workflow
-        # with a contents: write token can make a GitHub-signed commit authored by github-actions[bot],
-        # so each such commit must also be a recorded fixup: its only parent is the renovate[bot] commit
-        # before it on the PR, renovate_fixup_recorded finds the run that made it, and
-        # renovate_fixup_content finds it changes only what a go.sum fixup may.
+        # where Renovate cannot update it), and the last one is the head commit evaluated.
+        # A signature stays valid whoever pushes the commit, so a renovate[bot] commit from another PR, or
+        # from Renovate running on another repository, could be pushed here. Each renovate[bot] commit
+        # must therefore have a pull_request run that Renovate's own push of it started for this PR
+        # (renovate_pushed_runs): a push by anyone else starts its runs as them.
+        # Any workflow with a contents: write token can make a GitHub-signed commit authored by
+        # github-actions[bot], so each such commit must also be a recorded fixup: its only parent is the
+        # renovate[bot] commit before it on the PR, renovate_fixup_recorded finds the run that made it,
+        # and renovate_fixup_content finds it changes only what a go.sum fixup may.
         # A pull_request run executes the workflows of its PR's base branch, and anyone with write access
         # can open another PR from a Renovate branch into a branch of their own, or retarget this one, so
         # that Renovate's next push runs their workflow. A run's pull_requests field is read when it is
         # queried, not recorded when the run starts, so it does not show which PR started the run. A PR
-        # with a fixup therefore passes only when no PR but Renovate's has ever used its branch, and its
-        # base has never changed: PRs cannot be deleted, and the base change stays on the timeline.
+        # therefore passes only when no PR but Renovate's has ever used its branch, and its base has never
+        # changed: PRs cannot be deleted, and the base change stays on the timeline.
         renovate_commits_pass() {
-          local commits fixup parent
+          local commits created commit fixup parent
           commits=$(gh api graphql -f owner="${1%%/*}" -f name="${1#*/}" -F number="$2" -f branch="$4" -f query='
             query($owner: String!, $name: String!, $number: Int!, $branch: String!) {
               repository(owner: $owner, name: $name) {
                 pullRequests(headRefName: $branch, first: 100) { totalCount nodes { author { __typename login } } }
-                pullRequest(number: $number) {
+                pullRequest(number: $number) { createdAt
                 timelineItems(itemTypes: [BASE_REF_CHANGED_EVENT]) { filteredCount }
                 commits(last: 100) { totalCount nodes { commit { oid
                   parents(first: 2) { totalCount nodes { oid } }
@@ -137,37 +141,51 @@ jobs:
                     and ($c.nodes[$i - 1].commit.authors.nodes | all(.user.login == "renovate[bot]"))
                   else true end))
               and ($c.nodes[-1].commit.oid == $head)
-              and ((any($c.nodes[].commit.authors.nodes[]; .user.login == "github-actions[bot]") | not)
-                or (.data.repository.pullRequest.timelineItems.filteredCount == 0
-                  and .data.repository.pullRequests as $p | $p.totalCount == ($p.nodes | length)
-                  and ($p.nodes | all(.author.__typename == "Bot" and .author.login == "renovate"))))
+              and .data.repository.pullRequest.timelineItems.filteredCount == 0
+              and (.data.repository.pullRequests as $p | $p.totalCount == ($p.nodes | length)
+                and ($p.nodes | all(.author.__typename == "Bot" and .author.login == "renovate")))
           ' <<< "$commits" 2>/dev/null) == true ]] || { echo false; return; }
+          created=$(jq -r .data.repository.pullRequest.createdAt <<< "$commits")
+          while read -r commit; do
+            [[ -n $(renovate_pushed_runs "$1" "$2" "$4" "$5" "$created" "$commit") ]] || { echo false; return; }
+          done < <(jq -r '.data.repository.pullRequest.commits.nodes[].commit
+            | select(all(.authors.nodes[]; .user.login == "renovate[bot]")) | .oid' <<< "$commits")
           while read -r fixup parent; do
-            [[ $(renovate_fixup_recorded "$1" "$2" "$4" "$5" "$fixup" "$parent") == true \
+            [[ $(renovate_fixup_recorded "$1" "$2" "$4" "$5" "$created" "$fixup" "$parent") == true \
               && $(renovate_fixup_content "$1" "$fixup" "$parent") == true ]] || { echo false; return; }
           done < <(jq -r '.data.repository.pullRequest.commits.nodes[].commit
             | select(any(.authors.nodes[]; .user.login == "github-actions[bot]"))
             | "\(.oid) \(.parents.nodes[0].oid)"' <<< "$commits")
           echo true
         }
-        # Prints true only when the fixup $5, made on $6, is recorded by the first attempt of a pull_request
-        # run that Renovate's push of $6 started, from branch $3 of this repository into $4, for PR $2.
-        # With the checks in renovate_commits_pass, that run executed the workflows of base branch $4
-        # merged with Renovate's commit, which are reviewed code. The contract for a fixup workflow: after
-        # committing, upload an artifact named renovate-fixup-<commit oid>. Only the run itself can upload
-        # an artifact to it. A fixup without that record is recovered by ticking the rebase box on the PR,
-        # which has Renovate push a new commit; rerunning the workflow does not, as a rerun is not the
-        # first attempt and Renovate did not start it.
+        # Prints the pull_request runs that Renovate's own push of commit $6 started, from branch $3 of this
+        # repository into $4, for PR $2, created at $5: first attempts that renovate[bot] both started and
+        # triggered, since the PR was created. Renovate reuses a branch for the next PR once one merges, so
+        # a run from before the PR was Renovate's push for an earlier one. A commit from one of this PR's
+        # own earlier rebases still passes: it is Renovate's update for this PR. With the checks in
+        # renovate_commits_pass, those runs executed the workflows of base branch $4 merged with
+        # Renovate's commit, which are reviewed code.
+        renovate_pushed_runs() {
+          gh api "repos/$1/actions/runs?head_sha=$6&event=pull_request&per_page=100" |
+            jq -r --arg repo "$1" --arg branch "$3" --arg base "$4" --argjson number "$2" --arg created "$5" '
+              .workflow_runs[]
+              | select(.actor.login == "renovate[bot]" and .triggering_actor.login == "renovate[bot]"
+                  and .created_at >= $created
+                  and .run_attempt == 1 and .head_branch == $branch and .head_repository.full_name == $repo
+                  and (.pull_requests | length) == 1 and .pull_requests[0].number == $number
+                  and .pull_requests[0].base.ref == $base)
+              | .id'
+        }
+        # Prints true only when the fixup $6, made on $7, is recorded by one of renovate_pushed_runs for $7.
+        # The contract for a fixup workflow: after committing, upload an artifact named
+        # renovate-fixup-<commit oid>. Only the run itself can upload an artifact to it. A fixup without
+        # that record is recovered by ticking the rebase box on the PR, which has Renovate push a new
+        # commit; rerunning the workflow does not, as a rerun is not the first attempt and Renovate did
+        # not start it.
         renovate_fixup_recorded() {
           local id n
-          for id in $(gh api "repos/$1/actions/runs?head_sha=$6&event=pull_request&per_page=100" |
-              jq -r --arg repo "$1" --arg branch "$3" --arg base "$4" --argjson number "$2" '.workflow_runs[]
-                | select(.actor.login == "renovate[bot]" and .triggering_actor.login == "renovate[bot]"
-                    and .run_attempt == 1 and .head_branch == $branch and .head_repository.full_name == $repo
-                    and (.pull_requests | length) == 1 and .pull_requests[0].number == $number
-                    and .pull_requests[0].base.ref == $base)
-                | .id'); do
-            n=$(gh api "repos/$1/actions/runs/$id/artifacts?name=renovate-fixup-$5" \
+          for id in $(renovate_pushed_runs "$1" "$2" "$3" "$4" "$5" "$7"); do
+            n=$(gh api "repos/$1/actions/runs/$id/artifacts?name=renovate-fixup-$6" \
               --jq '[.artifacts[] | select(.expired | not)] | length') || n=0
             (( n > 0 )) && { echo true; return; }
           done
@@ -186,8 +204,8 @@ jobs:
         # A go.mod's directives at commit $2, one per line, all but require and go, comments dropped
         go_mod_directives() {
           local mod
-          mod=$(gh api "repos/$1/contents/go.mod?ref=$2" --jq .content) || return 1
-          base64 -d <<< "$mod" | sed 's|//.*||' | awk '
+          mod=$(gh api -H "Accept: application/vnd.github.raw" "repos/$1/contents/go.mod?ref=$2") && [[ -n $mod ]] || return 1
+          sed 's|//.*||' <<< "$mod" | awk '
             /^[[:space:]]*$/ { next }
             /^[[:space:]]*\)/ { block = ""; next }
             /^[a-z]+[[:space:]]*\([[:space:]]*$/ { block = $1; next }
