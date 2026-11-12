@@ -71,35 +71,31 @@ jobs:
               and ($names | any(test("^(Azure|sonic-net)\\.sonic")))
           ' <<< "$1" || echo false
         }
-        # A Renovate PR's checks: its statusCheckRollup, plus each required check of the base branch
-        # that the rollup lacks, read from the head commit. The rollup leaves out runs that no pull
-        # request event started, such as the CodeQL and Semgrep runs the go.sum workflow dispatches on
-        # its fixup commit, so a required check would never be found. Branch protection matches a
-        # required check by name on the commit and requires every check run and commit status of that
-        # name to pass, and so does this: the newest check run of that name and the newest commit
-        # status of that context are both added, each one only when the rollup lacks that kind. Every
-        # check in the rollup is kept and evaluated as before. Prints null when a call fails. The runs
-        # and statuses go through files, not arguments: a commit's check runs can be larger than one
-        # argument may be.
-        renovate_checks() {
-          local runs statuses
-          runs=$(gh api --paginate "repos/$1/commits/$2/check-runs?per_page=100" \
-            --jq '.check_runs[] | {id, name, status, conclusion}') &&
-          statuses=$(gh api --paginate "repos/$1/commits/$2/statuses?per_page=100" --jq '.[] | {id, context, state}') &&
-          jq -c --argjson required "$4" --slurpfile runs <(printf '%s\n' "$runs") \
-              --slurpfile statuses <(printf '%s\n' "$statuses") '
-            (. // []) as $rollup
-            | [ $rollup[] | select(.__typename != "StatusContext") | .name ] as $run_names
-            | [ $rollup[] | select(.__typename == "StatusContext") | .context ] as $status_names
-            | $rollup + [ $required[] as $r
-                | (select($run_names | index([$r]) == null)
-                   | [ $runs[] | select(.name == $r) ] | max_by(.id) // empty
-                   | { __typename: "CheckRun", name: $r, status: (.status | ascii_upcase),
-                       conclusion: (.conclusion // "" | ascii_upcase) }),
-                  (select($status_names | index([$r]) == null)
-                   | [ $statuses[] | select(.context == $r) ] | max_by(.id) // empty
-                   | { __typename: "StatusContext", context: $r, state: (.state | ascii_upcase) }) ]
-          ' <<< "$3" || echo null
+        # The go.sum workflow commits its fixup as github-actions[bot], whose pull_request runs wait
+        # for approval: the repository requires it for an outside contributor, and an app cannot be
+        # made a collaborator. Branch protection counts only runs a pull request event started, so
+        # those runs have to run. Approves each one waiting on the head commit of this PR's own
+        # branch, or reruns it when GitHub refuses the approval, which starts it as mssonicbld.
+        # Called only once every commit on the PR has passed renovate_commits_pass, so no code a
+        # person pushed is run. Each action is logged with its result. Prints true when it approved
+        # or reran any run: the checks were read before, so the PR merges on a later scan.
+        renovate_approve_runs() {
+          local id out acted=false
+          for id in $(gh api "repos/$1/actions/runs?head_sha=$2&status=action_required&per_page=100" |
+              jq -r --arg repo "$1" --arg branch "$3" --argjson number "${4##*/}" '.workflow_runs[]
+                | select(.event == "pull_request" and .head_branch == $branch
+                    and .head_repository.full_name == $repo and any(.pull_requests[]; .number == $number))
+                | .id'); do
+            acted=true
+            if out=$(gh api -X POST "repos/$1/actions/runs/$id/approve" 2>&1); then
+              echo "    $4: approved workflow run $id" >> skip_prs.log
+            elif out=$(gh api -X POST "repos/$1/actions/runs/$id/rerun" 2>&1); then
+              echo "    $4: reran workflow run $id" >> skip_prs.log
+            else
+              echo "    $4: failed to approve or rerun workflow run $id: $out" >> failure_prs.log
+            fi
+          done
+          echo $acted
         }
         # Anyone with write access can push to a Renovate branch, and a pushed commit can name any author.
         # Prints true only when every commit on the PR was signed by GitHub and authored by renovate[bot],
@@ -137,8 +133,8 @@ jobs:
             upgrade_versions_prs=$(gh pr list -A mssonicbld -R $repo -L 100 --search "(\"Upgrade SONiC package Versions\" OR \"Upgrade docker-sonic-mgmt package versions\" OR \"Upgrade docker-ptf package versions\") in:title created:>=$date_1m_ago_q" --json body,title,url,labels,statusCheckRollup,createdAt,baseRefName,comments)
             # Renovate labels a security update automerge only when it is not a major bump. Listed at any age:
             # a security update can stay open past a month while a blocker is fixed, and still has to merge
-            renovate_prs=$(gh pr list -A app/renovate --label automerge --label security -R $repo -L 100 --json author,body,title,url,labels,statusCheckRollup,createdAt,baseRefName,comments,headRefOid)
-            qualified_approval_prs=$(gh pr list --label Qualified-approval -R $repo -L 100 --search "updated:>=$date_1m_ago_q" --json author,body,title,url,labels,statusCheckRollup,createdAt,baseRefName,comments,headRefOid)
+            renovate_prs=$(gh pr list -A app/renovate --label automerge --label security -R $repo -L 100 --json author,body,title,url,labels,statusCheckRollup,createdAt,baseRefName,comments,headRefOid,headRefName)
+            qualified_approval_prs=$(gh pr list --label Qualified-approval -R $repo -L 100 --search "updated:>=$date_1m_ago_q" --json author,body,title,url,labels,statusCheckRollup,createdAt,baseRefName,comments,headRefOid,headRefName)
             prs=$(jq -sc 'add | unique_by(.url)' <(echo "$automerge_prs") <(echo "$upgrade_versions_prs") <(echo "$renovate_prs") <(echo "$qualified_approval_prs"))
             c=$(echo $prs | jq length)
             for ((i=0; i<$c; i++)); do
@@ -191,10 +187,13 @@ jobs:
               if [[ $(echo $pr | jq -r '.author.login // ""') == "app/renovate" ]]; then
                 renovate=true
                 required=$(gh api "repos/$repo/branches/$(echo $pr | jq -r .baseRefName)" --jq '.protection.required_status_checks.contexts // []' || echo null)
-                [[ $required != null ]] && checks=$(renovate_checks "$repo" "$(echo $pr | jq -r .headRefOid)" "$checks" "$required")
+                commits_pass=$(renovate_commits_pass "$repo" "${url##*/}" "$(echo $pr | jq -r .headRefOid)")
+                approved=false
+                [[ $commits_pass == true ]] && approved=$(renovate_approve_runs "$repo" "$(echo $pr | jq -r .headRefOid)" \
+                  "$(echo $pr | jq -r .headRefName)" "$url")
                 pr_success=false
                 [[ $required != null && $(renovate_checks_pass "$checks" "$required") == true \
-                  && $(renovate_commits_pass "$repo" "${url##*/}" "$(echo $pr | jq -r .headRefOid)") == true ]] && pr_success=true
+                  && $commits_pass == true && $approved == false ]] && pr_success=true
                 # Merge only the commit whose checks were evaluated
                 merge_head="--match-head-commit $(echo $pr | jq -r .headRefOid)"
               fi
