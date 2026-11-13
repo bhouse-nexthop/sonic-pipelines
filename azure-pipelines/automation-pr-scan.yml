@@ -114,20 +114,22 @@ jobs:
         # that Renovate's next push runs their workflow. A run's pull_requests field is read when it is
         # queried, not recorded when the run starts, so it does not show which PR started the run. A PR
         # therefore passes only when no PR but Renovate's has ever used its branch, and its base has never
-        # changed: PRs cannot be deleted, and the base change stays on the timeline.
+        # changed: PRs cannot be deleted, and the base change stays on the timeline. headRefName also
+        # matches PRs from a fork's branch of the same name, whose runs Renovate's push does not start, so
+        # only PRs from this repository count.
         renovate_commits_pass() {
           local commits created commit fixup parent
           commits=$(gh api graphql -f owner="${1%%/*}" -f name="${1#*/}" -F number="$2" -f branch="$4" -f query='
             query($owner: String!, $name: String!, $number: Int!, $branch: String!) {
               repository(owner: $owner, name: $name) {
-                pullRequests(headRefName: $branch, first: 100) { totalCount nodes { author { __typename login } } }
+                pullRequests(headRefName: $branch, first: 100) { totalCount nodes { author { __typename login } headRepository { nameWithOwner } } }
                 pullRequest(number: $number) { createdAt
                 timelineItems(itemTypes: [BASE_REF_CHANGED_EVENT]) { filteredCount }
                 commits(last: 100) { totalCount nodes { commit { oid
                   parents(first: 2) { totalCount nodes { oid } }
                   authors(first: 10) { nodes { user { login } } }
                   signature { isValid wasSignedByGitHub } } } } } } }') || { echo false; return; }
-          [[ $(jq -r --arg head "$3" '
+          [[ $(jq -r --arg head "$3" --arg repo "$1" '
             .data.repository.pullRequest.commits as $c
             | ($c.totalCount > 0) and ($c.totalCount == ($c.nodes | length))
               and ($c.nodes | all(.commit
@@ -143,7 +145,8 @@ jobs:
               and ($c.nodes[-1].commit.oid == $head)
               and .data.repository.pullRequest.timelineItems.filteredCount == 0
               and (.data.repository.pullRequests as $p | $p.totalCount == ($p.nodes | length)
-                and ($p.nodes | all(.author.__typename == "Bot" and .author.login == "renovate")))
+                and ($p.nodes | map(select((.headRepository.nameWithOwner // "" | ascii_downcase) == ($repo | ascii_downcase)))
+                  | all(.author.__typename == "Bot" and .author.login == "renovate")))
           ' <<< "$commits" 2>/dev/null) == true ]] || { echo false; return; }
           created=$(jq -r .data.repository.pullRequest.createdAt <<< "$commits")
           while read -r commit; do
