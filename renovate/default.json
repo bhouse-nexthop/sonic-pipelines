@@ -43,6 +43,14 @@
       "groupName": null
     },
     {
+      "description": "Cargo treats a minor update below 1.0, such as 0.12 to 0.14, as breaking, so it gets its own pull request, like a major. In the minor group, several API changes land behind one build that cannot pass until all of them are fixed",
+      "matchBaseBranches": ["master"],
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor"],
+      "matchCurrentVersion": "<1.0.0",
+      "groupName": null
+    },
+    {
       "description": "Release branches take security updates, and hand-pinned versions, only",
       "matchBaseBranches": ["/^(20261[12]|20(2[7-9]|[3-9][0-9])(0[1-9]|1[0-2]))$/"],
       "matchManagers": ["!custom.regex"],
